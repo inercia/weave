@@ -1,53 +1,478 @@
 package nameserver
 
 import (
+	"fmt"
+	"github.com/miekg/dns"
 	. "github.com/weaveworks/weave/common"
+	wt "github.com/weaveworks/weave/testing"
 	"net"
+	"strconv"
+	"sync"
+	"testing"
+	"time"
+)
+
+const (
+	testSocketTimeout = 100 // in millisecs
 )
 
 // Warn about some methods that some day should be implemented...
 func notImplWarn() { Warning.Printf("Mocked method. Not implemented.") }
 
-// A mocked Zone that always returns the same record
-type mockedZone struct {
-	record ZoneRecord
+// A mocked Zone that always returns the same records
+// * it does not send/receive any mDNS query
+type mockedZoneWithRecords struct {
+	sync.RWMutex
+
+	records []ZoneRecord
 
 	// Statistics
 	NumLookupsName   int
 	NumLookupsInaddr int
 }
 
-func NewMockedZone(zr ZoneRecord) *mockedZone { return &mockedZone{record: zr} }
-func (mz mockedZone) Domain() string          { return DefaultLocalDomain }
-func (mz mockedZone) LookupName(name string) ([]ZoneRecord, error) {
-	Debug.Printf("[mocked zone]: LookupName: returning record %s", mz.record)
-	mz.NumLookupsName += 1
-	return []ZoneRecord{mz.record}, nil
+func newMockedZoneWithRecords(zr []ZoneRecord) *mockedZoneWithRecords {
+	return &mockedZoneWithRecords{records: zr}
 }
-func (mz mockedZone) LookupInaddr(inaddr string) ([]ZoneRecord, error) {
-	Debug.Printf("[mocked zone]: LookupInaddr: returning record %s", mz.record)
+func (mz mockedZoneWithRecords) Domain() string { return DefaultLocalDomain }
+func (mz *mockedZoneWithRecords) LookupName(name string) ([]ZoneRecord, error) {
+	Debug.Printf("[mocked zone]: LookupName: returning records %s", mz.records)
+	mz.Lock()
+	defer mz.Unlock()
+
+	mz.NumLookupsName += 1
+	res := make([]ZoneRecord, 0)
+	for _, r := range mz.records {
+		if r.Name() == name {
+			res = append(res, r)
+		}
+	}
+	return res, nil
+}
+
+func (mz *mockedZoneWithRecords) LookupInaddr(inaddr string) ([]ZoneRecord, error) {
+	Debug.Printf("[mocked zone]: LookupInaddr: returning records %s", mz.records)
+	mz.Lock()
+	defer mz.Unlock()
+
 	mz.NumLookupsInaddr += 1
-	return []ZoneRecord{mz.record}, nil
+	res := make([]ZoneRecord, 0)
+	for _, r := range mz.records {
+		revIP, err := raddrToIP(inaddr)
+		if err != nil {
+			return nil, newParseError("lookup address", inaddr)
+		}
+		if r.IP().Equal(revIP) {
+			res = append(res, r)
+		}
+	}
+	return res, nil
+}
+
+func (mz mockedZoneWithRecords) DomainLookupName(name string) ([]ZoneRecord, error) {
+	return mz.LookupName(name)
+}
+func (mz mockedZoneWithRecords) DomainLookupInaddr(inaddr string) ([]ZoneRecord, error) {
+	return mz.LookupInaddr(inaddr)
 }
 
 // the following methods are not currently needed...
-func (mz mockedZone) Status() string                                       { notImplWarn(); return "nothing" }
-func (mz mockedZone) AddRecord(ident string, name string, ip net.IP) error { notImplWarn(); return nil }
-func (mz mockedZone) DeleteRecord(ident string, ip net.IP) error           { notImplWarn(); return nil }
-func (mz mockedZone) DeleteRecordsFor(ident string) error                  { notImplWarn(); return nil }
-func (mz mockedZone) DomainLookupName(name string) ([]ZoneRecord, error) {
-	notImplWarn()
-	return nil, nil
-}
-func (mz mockedZone) DomainLookupInaddr(inaddr string) ([]ZoneRecord, error) {
-	notImplWarn()
-	return nil, nil
-}
-func (mz mockedZone) ObserveName(name string, observer ZoneRecordObserver) error {
+func (mz mockedZoneWithRecords) AddRecord(ident string, name string, ip net.IP) error {
 	notImplWarn()
 	return nil
 }
-func (mz mockedZone) ObserveInaddr(inaddr string, observer ZoneRecordObserver) error {
+func (mz mockedZoneWithRecords) DeleteRecord(ident string, ip net.IP) error { notImplWarn(); return nil }
+func (mz mockedZoneWithRecords) DeleteRecordsFor(ident string) error        { notImplWarn(); return nil }
+func (mz mockedZoneWithRecords) Status() string                             { notImplWarn(); return "nothing" }
+func (mz mockedZoneWithRecords) ObserveName(name string, observer ZoneRecordObserver) error {
 	notImplWarn()
 	return nil
+}
+func (mz mockedZoneWithRecords) ObserveInaddr(inaddr string, observer ZoneRecordObserver) error {
+	notImplWarn()
+	return nil
+}
+
+//////////////////////////////////////////////////////////////////
+
+// A mocked mDNS server
+type mockedMDNSServer struct {
+	zone Zone
+}
+
+func newMockedMDNSServer(z Zone) *mockedMDNSServer        { return &mockedMDNSServer{zone: z} }
+func (ms *mockedMDNSServer) Start(_ *net.Interface) error { return nil }
+func (ms *mockedMDNSServer) Stop() error                  { return nil }
+func (ms *mockedMDNSServer) Zone() Zone                   { return ms.zone }
+
+// a useful mix of NewMockedZone and NewMockedMDNSServer
+func newMockedMDNSServerWithRecord(zr ZoneRecord) *mockedMDNSServer {
+	return newMockedMDNSServer(newMockedZoneWithRecords([]ZoneRecord{zr}))
+}
+func newMockedMDNSServerWithRecords(zrs []ZoneRecord) *mockedMDNSServer {
+	return newMockedMDNSServer(newMockedZoneWithRecords(zrs))
+}
+
+//////////////////////////////////////////////////////////////////
+
+// A mocked mDNS client.
+// This mock asks a group of (potentially mocked) mDNS servers
+type mockedMDNSCLient struct {
+	sync.RWMutex
+
+	servers map[ZoneMDNSServer]ZoneMDNSServer
+
+	// Statistics
+	NumLookupsName      int
+	NumLookupsInaddr    int
+	NumInsLookupsName   int
+	NumInsLookupsInaddr int
+}
+
+func newMockedMDNSClient(srvrs []*mockedMDNSServer) *mockedMDNSCLient {
+	r := mockedMDNSCLient{
+		servers: make(map[ZoneMDNSServer]ZoneMDNSServer),
+	}
+	if srvrs != nil {
+		for _, server := range srvrs {
+			r.servers[server] = server
+		}
+	}
+	return &r
+}
+
+func (mc *mockedMDNSCLient) Start(ifi *net.Interface) error { return nil }
+func (mc *mockedMDNSCLient) Stop() error                    { return nil }
+func (mc *mockedMDNSCLient) Domain() string                 { return DefaultLocalDomain }
+func (mc *mockedMDNSCLient) LookupName(name string) ([]ZoneRecord, error) {
+	mc.Lock()
+	defer mc.Unlock()
+
+	// get a random result
+	mc.NumLookupsName += 1
+	for _, server := range mc.servers {
+		r, err := server.Zone().LookupName(name)
+		if err == nil {
+			return r, nil // return the first answer
+		}
+	}
+	return nil, LookupError(name)
+}
+
+func (mc *mockedMDNSCLient) LookupInaddr(inaddr string) ([]ZoneRecord, error) {
+	mc.Lock()
+	defer mc.Unlock()
+
+	// get a random result
+	mc.NumLookupsInaddr += 1
+	for _, server := range mc.servers {
+		r, err := server.Zone().LookupInaddr(inaddr)
+		if err == nil {
+			return r, nil // return the first answer
+		}
+	}
+	return nil, LookupError(inaddr)
+}
+
+func (mc *mockedMDNSCLient) InsistentLookupName(name string) ([]ZoneRecord, error) {
+	mc.Lock()
+	defer mc.Unlock()
+
+	res := make([]ZoneRecord, 0)
+	mc.NumInsLookupsName += 1
+	for _, server := range mc.servers {
+		r, err := server.Zone().LookupName(name)
+		if err == nil {
+			res = append(res, r...)
+		}
+	}
+	if len(res) == 0 {
+		return nil, LookupError(name)
+	}
+	return res, nil
+}
+
+func (mc *mockedMDNSCLient) InsistentLookupInaddr(inaddr string) ([]ZoneRecord, error) {
+	mc.Lock()
+	defer mc.Unlock()
+
+	res := make([]ZoneRecord, 0)
+	mc.NumInsLookupsInaddr += 1
+	for _, server := range mc.servers {
+		r, err := server.Zone().LookupInaddr(inaddr)
+		if err == nil {
+			res = append(res, r...)
+		}
+	}
+	if len(res) == 0 {
+		return nil, LookupError(inaddr)
+	}
+	return res, nil
+}
+
+func (mc *mockedMDNSCLient) AddServer(srv ZoneMDNSServer) {
+	mc.Lock()
+	defer mc.Unlock()
+	mc.servers[srv] = srv
+}
+
+func (mc *mockedMDNSCLient) RemoveServer(srv ZoneMDNSServer) {
+	mc.Lock()
+	defer mc.Unlock()
+	delete(mc.servers, srv)
+}
+
+//////////////////////////////////////////////////////////////////
+
+type zbmEntry struct {
+	Server *mockedMDNSServer
+	Client *mockedMDNSCLient
+	Zone   *zoneDb
+}
+type zoneDbsWithMockedMDns []*zbmEntry
+
+// Creates a group of (real) zone databases linked through mocked mDNS servers and clients
+// This effectively creates a cluster of WeaveDNS peers
+func newZoneDbsWithMockedMDns(num int, config ZoneConfig) zoneDbsWithMockedMDns {
+	res := make(zoneDbsWithMockedMDns, num)
+
+	for i := 0; i < num; i++ {
+		res[i] = new(zbmEntry)
+
+		Debug.Printf("[test] Creating mocked mDNS server #%d", i)
+		res[i].Server = newMockedMDNSServer(nil)
+
+		Debug.Printf("[test] Creating mocked mDNS client #%d", i)
+		res[i].Client = newMockedMDNSClient([]*mockedMDNSServer{})
+
+		cfg := config
+		cfg.MDNSClient = res[i].Client
+		cfg.MDNSServer = res[i].Server
+
+		Debug.Printf("[test] Creating ZoneDb #%d", i)
+		res[i].Zone, _ = NewZoneDb(cfg)
+
+		// link the mDNS server to its zone
+		// ZoneDbs are connected to mDNS in two directions: they use their mDNS
+		// clients for asking other peers about names/IPs, and export their records
+		// through a mDNS server.
+		res[i].Server.zone = res[i].Zone
+	}
+
+	// link all the clients to all the servers
+	for i := 0; i < num; i++ {
+		for j := 0; j < num; j++ {
+			// with this check, the local client will not ask to the local server
+			// this is not what we currently do, but can be convenient in some cases
+			// for finding some bugs...
+			if i != j {
+				Debug.Printf("[test] Linking mocked mDNS client #%d to server #%d", i, j)
+				res[i].Client.AddServer(res[j].Server)
+			}
+		}
+	}
+
+	return res
+}
+
+func (zbs zoneDbsWithMockedMDns) Start() {
+	for _, entry := range zbs {
+		entry.Zone.Start()
+	}
+}
+
+func (zbs zoneDbsWithMockedMDns) Stop() {
+	for _, entry := range zbs {
+		entry.Zone.Stop()
+	}
+}
+
+//////////////////////////////////////////////////////////////////
+
+// A mocked cache where we never find a single thing... ;)
+type mockedCache struct {
+	NumGets     int
+	NumPuts     int
+	NumRemovals int
+}
+
+func newMockedCache() *mockedCache { return &mockedCache{} }
+
+func (c *mockedCache) Get(request *dns.Msg, maxLen int) (reply *dns.Msg, err error) {
+	c.NumGets += 1
+	return nil, nil
+}
+func (c *mockedCache) Put(request *dns.Msg, reply *dns.Msg, ttl int, flags uint8) int {
+	c.NumPuts += 1
+	return 0
+}
+func (c *mockedCache) Remove(question *dns.Question) { c.NumRemovals += 1 }
+func (c *mockedCache) Purge()                        {}
+func (c *mockedCache) Clear()                        {}
+func (c *mockedCache) Len() int                      { return 0 }
+func (c *mockedCache) Capacity() int                 { return DefaultCacheLen }
+
+//////////////////////////////////////////////////////////////////
+
+// A mocked fallback server
+type mockedFallback struct {
+	CliConfig *dns.ClientConfig
+	Addr      string
+	Port      int
+
+	udpSrv *dns.Server
+	tcpSrv *dns.Server
+}
+
+// Create a mocked fallback server
+// You can use the server's `CliConfig` as the `UpstreamCfg` of a `DNSServer`...
+func newMockedFallback(udpH dns.HandlerFunc, tcpH dns.HandlerFunc) (*mockedFallback, error) {
+	udpSrv, fallbackAddr, err := runLocalUDPServer("127.0.0.1:0", udpH)
+	if err != nil {
+		return nil, err
+	}
+	_, fallbackPort, err := net.SplitHostPort(fallbackAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	fallbackPortI, _ := strconv.Atoi(fallbackPort)
+
+	res := mockedFallback{
+		udpSrv: udpSrv,
+		Addr:   fallbackAddr,
+		Port:   fallbackPortI,
+		CliConfig: &dns.ClientConfig{
+			Servers: []string{"127.0.0.1"},
+			Port:    fallbackPort,
+		},
+	}
+
+	if tcpH != nil {
+		fallbackTCPAddr := fmt.Sprintf("127.0.0.1:%s", fallbackPort)
+		res.tcpSrv, _, err = runLocalTCPServer(fallbackTCPAddr, tcpH)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &res, nil
+}
+
+// Start the fallback server
+func (mf *mockedFallback) Start() error {
+	return nil
+}
+
+// Stop the fallback server
+func (mf *mockedFallback) Stop() error {
+	if mf.tcpSrv != nil {
+		mf.udpSrv.Shutdown()
+		mf.udpSrv = nil
+	}
+	if mf.tcpSrv != nil {
+		mf.tcpSrv.Shutdown()
+		mf.udpSrv = nil
+	}
+	return nil
+}
+
+// Run a UDP fallback server
+func runLocalUDPServer(laddr string, handler dns.HandlerFunc) (*dns.Server, string, error) {
+	Debug.Printf("[mocked fallback] Starting fallback UDP server at %s", laddr)
+	pc, err := net.ListenPacket("udp", laddr)
+	if err != nil {
+		return nil, "", err
+	}
+	server := &dns.Server{PacketConn: pc, Handler: handler, ReadTimeout: testSocketTimeout * time.Millisecond}
+
+	go func() {
+		server.ActivateAndServe()
+		pc.Close()
+	}()
+
+	Debug.Printf("[mocked fallback] Fallback UDP server listening at %s", pc.LocalAddr())
+	return server, pc.LocalAddr().String(), nil
+}
+
+// Run a TCP fallback server
+func runLocalTCPServer(laddr string, handler dns.HandlerFunc) (*dns.Server, string, error) {
+	Debug.Printf("[mocked fallback] Starting fallback TCP server at %s", laddr)
+	laddrTCP, err := net.ResolveTCPAddr("tcp", laddr)
+	if err != nil {
+		return nil, "", err
+	}
+
+	l, err := net.ListenTCP("tcp", laddrTCP)
+	if err != nil {
+		return nil, "", err
+	}
+	server := &dns.Server{Listener: l, Handler: handler, ReadTimeout: testSocketTimeout * time.Millisecond}
+
+	go func() {
+		server.ActivateAndServe()
+		l.Close()
+	}()
+
+	Debug.Printf("[mocked fallback] Fallback TCP server listening at %s", l.Addr().String())
+	return server, l.Addr().String(), nil
+}
+
+//////////////////////////////////////////////////////////////////
+
+// Perform a DNS query and assert the reply code, number or answers, etc
+func assertExchange(t *testing.T, z string, ty uint16, port int, minAnswers int, maxAnswers int, expErr int) (*dns.Msg, *dns.Msg) {
+	wt.AssertNotEqualInt(t, port, 0, "invalid DNS server port")
+
+	c := &dns.Client{
+		UDPSize: testUDPBufSize,
+	}
+
+	m := new(dns.Msg)
+	m.RecursionDesired = true
+	m.SetQuestion(z, ty)
+	m.SetEdns0(testUDPBufSize, false) // we don't want to play with truncation here...
+
+	lstAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	r, _, err := c.Exchange(m, lstAddr)
+	t.Logf("Response from '%s':\n%+v\n", lstAddr, r)
+	if err != nil {
+		t.Fatalf("Error when querying DNS server at %s: %s", lstAddr, err)
+	}
+	wt.AssertNoErr(t, err)
+	if minAnswers == 0 && maxAnswers == 0 {
+		wt.AssertStatus(t, r.Rcode, expErr, "DNS response code")
+	} else {
+		wt.AssertStatus(t, r.Rcode, dns.RcodeSuccess, "DNS response code")
+	}
+	answers := len(r.Answer)
+	if minAnswers >= 0 && answers < minAnswers {
+		wt.Fatalf(t, "Number of answers >= %d", minAnswers)
+	}
+	if maxAnswers >= 0 && answers > maxAnswers {
+		wt.Fatalf(t, "Number of answers <= %d", maxAnswers)
+	}
+	return m, r
+}
+
+// Assert that we have a response in the cache for a query `q`
+func assertInCache(t *testing.T, cache ZoneCache, q *dns.Msg, desc string) {
+	r, err := cache.Get(q, maxUDPSize)
+	wt.AssertNoErr(t, err)
+	wt.AssertNotNil(t, r, fmt.Sprintf("value in the cache: %s", desc))
+}
+
+// Assert that we have a response in the cache for a query `q`
+func assertNotLocalInCache(t *testing.T, cache ZoneCache, q *dns.Msg, desc string) {
+	r, err := cache.Get(q, maxUDPSize)
+	if !(r == nil && err == errNoLocalReplies) {
+		t.Fatalf("Cache does not return a noLocalReplies error for query %s", q)
+	}
+}
+
+// Assert that we do not have a response in the cache for a query `q`
+func assertNotInCache(t *testing.T, cache ZoneCache, q *dns.Msg, desc string) {
+	r, err := cache.Get(q, maxUDPSize)
+	wt.AssertNoErr(t, err)
+	wt.AssertNil(t, r, fmt.Sprintf("value in the cache: %s\n%s", desc, r))
 }
